@@ -2,7 +2,7 @@
   description = "Native GPUI photo-first file organizer";
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    findmatch.url = "github:Vanish-prog/search-tool/5b80bb835f0f454acddb360c037e369ef879582d";
+    findmatch.url = "github:Vanish-prog/search-tool";
   };
   outputs = { self, nixpkgs, findmatch }: let
     system = "x86_64-linux";

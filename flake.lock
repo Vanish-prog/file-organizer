@@ -5,17 +5,16 @@
         "nixpkgs": "nixpkgs"
       },
       "locked": {
-        "lastModified": 1791826202,
-        "narHash": "sha256-jdui5thnGGL5X1oJme9GSA+HuQeW4CtdGrlINdRjFLQ=",
+        "lastModified": 1791960021,
+        "narHash": "sha256-B0F/S5t9g+LFHSpU2sH84RymQ6EVl3wiCWF8f0jhjpk=",
         "owner": "Vanish-prog",
         "repo": "search-tool",
-        "rev": "5b80bb835f0f454acddb360c037e369ef879582d",
+        "rev": "f6a5c34585fd9a5eac1c0fb108b70d7602f08e81",
         "type": "github"
       },
       "original": {
         "owner": "Vanish-prog",
         "repo": "search-tool",
-        "rev": "5b80bb835f0f454acddb360c037e369ef879582d",
         "type": "github"
       }
     },
