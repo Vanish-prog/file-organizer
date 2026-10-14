@@ -9,6 +9,62 @@ pub struct SearchRequest {
     pub reference: Option<PathBuf>,
     pub limit: usize,
 }
+/// File-start events report N-1 completed files; completion is emitted only after
+/// successful, valid backend output. The current backend exposes only indexing
+/// counts, not a reliable ranking/model-loading stage boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SearchProgress {
+    pub stage: String,
+    pub completed: usize,
+    pub total: usize,
+}
+
+fn report_progress(progress: &dyn Fn(SearchProgress), event: SearchProgress) {
+    // An observer must not unwind through the pipe reader or strand the child.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| progress(event)));
+}
+
+fn processing_progress(line: &str) -> Option<SearchProgress> {
+    let (counts, filename) = line.strip_prefix("Processing ")?.split_once(": ")?;
+    if filename.is_empty() {
+        return None;
+    }
+    let (number, total) = counts.split_once('/')?;
+    if number.is_empty()
+        || total.is_empty()
+        || !number.bytes().all(|b| b.is_ascii_digit())
+        || !total.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let number: usize = number.parse().ok()?;
+    let total: usize = total.parse().ok()?;
+    if number == 0 || total == 0 || number > total {
+        return None;
+    }
+    Some(SearchProgress {
+        stage: "indexing".into(),
+        completed: number - 1,
+        total,
+    })
+}
+
+fn observe_processing(
+    line: &[u8],
+    last: &mut Option<SearchProgress>,
+    progress: &dyn Fn(SearchProgress),
+) {
+    if let Some(event) = processing_progress(&String::from_utf8_lossy(line)) {
+        if last.as_ref().is_some_and(|previous| {
+            previous.total != event.total || previous.completed >= event.completed
+        }) {
+            return;
+        }
+        report_progress(progress, event.clone());
+        *last = Some(event);
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct Hit {
     pub path: PathBuf,
@@ -39,11 +95,22 @@ fn parse_hits(root: &std::path::Path, data: &[u8]) -> Result<Vec<Hit>> {
     Ok(hits)
 }
 fn permission_response(prompt: &str, processing: bool, download: bool) -> Option<&'static str> {
-    if prompt.contains("Process these files before searching? [y/N]") {
+    // Filenames and backend diagnostics are data even when they contain [y/N].
+    if prompt.starts_with("Processing ") || prompt.starts_with("findmatch:") {
+        return None;
+    }
+    let processing_prompt = "Process these files before searching? [y/N]";
+    let numbered_prompt = prompt
+        .strip_suffix(processing_prompt)
+        .and_then(|s| s.strip_suffix(" files need processing. "))
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    if prompt == processing_prompt || numbered_prompt {
         Some(if processing { "y\n" } else { "n\n" })
-    } else if prompt.contains("Download EmbeddingGemma 2") && prompt.contains("[y/N]") {
+    } else if prompt
+        == "Download EmbeddingGemma 2 (approximately 485 MB) for local inference? [y/N]"
+    {
         Some(if download { "y\n" } else { "n\n" })
-    } else if prompt.contains("[y/N]") {
+    } else if prompt.ends_with("[y/N]") {
         Some("n\n")
     } else {
         None
@@ -83,18 +150,32 @@ pub fn search(
     allow_processing: bool,
     allow_download: bool,
 ) -> Result<Vec<Hit>> {
+    search_with_progress(req, allow_processing, allow_download, |_| {})
+}
+
+/// Streams bounded stderr indexing records as they arrive. Observers run on the
+/// stderr reader thread (final completion on the caller) and should return promptly;
+/// observer panics are caught. Cached searches may produce no progress events.
+pub fn search_with_progress(
+    req: &SearchRequest,
+    allow_processing: bool,
+    allow_download: bool,
+    progress: impl Fn(SearchProgress) + Send + Sync + 'static,
+) -> Result<Vec<Hit>> {
     let program = resolve_program(
         std::env::var_os("FILE_ORGANIZER_FINDMATCH"),
         option_env!("FILE_ORGANIZER_FINDMATCH"),
     );
-    run_search(
+    run_search_with_progress(
         req,
         allow_processing,
         allow_download,
         &program,
         std::time::Duration::from_secs(600),
+        progress,
     )
 }
+#[cfg(test)]
 fn run_search(
     req: &SearchRequest,
     processing: bool,
@@ -102,11 +183,38 @@ fn run_search(
     program: &std::path::Path,
     timeout: std::time::Duration,
 ) -> Result<Vec<Hit>> {
+    run_search_with_progress(req, processing, download, program, timeout, |_| {})
+}
+
+fn run_search_with_progress(
+    req: &SearchRequest,
+    processing: bool,
+    download: bool,
+    program: &std::path::Path,
+    timeout: std::time::Duration,
+    progress: impl Fn(SearchProgress) + Send + Sync + 'static,
+) -> Result<Vec<Hit>> {
+    let progress = std::sync::Arc::new(progress);
     use std::io::{Read, Write};
     use std::process::{Command, Stdio};
     anyhow::ensure!(req.limit > 0, "Search limit must be positive");
     let root = req.root.canonicalize()?;
     anyhow::ensure!(root.is_dir(), "Search root is not a directory");
+    // Legacy findmatch prints filenames verbatim. CR/LF filenames make its
+    // human-readable protocol ambiguous; retain an indeterminate UI for those trees.
+    let unambiguous_progress = walkdir::WalkDir::new(&root)
+        .follow_links(false)
+        .into_iter()
+        .all(|entry| {
+            entry.is_ok_and(|entry| {
+                use std::os::unix::ffi::OsStrExt;
+                !entry
+                    .file_name()
+                    .as_bytes()
+                    .iter()
+                    .any(|b| *b == b'\n' || *b == b'\r')
+            })
+        });
     let mut command = Command::new(program);
     command
         .arg("--json")
@@ -142,39 +250,60 @@ fn run_search(
     });
     let mut stderr = child.stderr.take().unwrap();
     let mut stdin = child.stdin.take().unwrap();
-    let err = std::thread::spawn(move || -> std::io::Result<Vec<u8>> {
-        let mut diagnostics = std::collections::VecDeque::new();
-        let mut line = std::collections::VecDeque::new();
-        let mut byte = [0];
-        while stderr.read(&mut byte)? != 0 {
-            if diagnostics.len() == 16384 {
-                diagnostics.pop_front();
+    let reader_progress = progress.clone();
+    let err = std::thread::spawn(
+        move || -> std::io::Result<(Vec<u8>, Option<SearchProgress>)> {
+            let mut diagnostics = std::collections::VecDeque::new();
+            let mut line = Vec::new();
+            let mut truncated = false;
+            let mut prompt_space = false;
+            let mut last_progress = None;
+            let mut started_processing = false;
+            let mut byte = [0];
+            while stderr.read(&mut byte)? != 0 {
+                if diagnostics.len() == 16384 {
+                    diagnostics.pop_front();
+                }
+                diagnostics.push_back(byte[0]);
+                if prompt_space {
+                    prompt_space = false;
+                    if byte[0] == b' ' {
+                        continue;
+                    }
+                }
+                if byte[0] == b'\n' || byte[0] == b'\r' {
+                    started_processing |= line.starts_with(b"Processing ");
+                    if unambiguous_progress {
+                        observe_processing(&line, &mut last_progress, reader_progress.as_ref());
+                    }
+                    line.clear();
+                    truncated = false;
+                    continue;
+                }
+                // Preserve the anchored prefix, never reinterpret a truncated tail.
+                if line.len() < 4096 {
+                    line.push(byte[0]);
+                } else {
+                    truncated = true;
+                }
+                if !started_processing
+                    && !truncated
+                    && line.ends_with(b"[y/N]")
+                    && let Some(answer) =
+                        permission_response(&String::from_utf8_lossy(&line), processing, download)
+                {
+                    stdin.write_all(answer.as_bytes())?;
+                    stdin.flush()?;
+                    line.clear();
+                    prompt_space = true; // ask() prints one trailing space.
+                }
             }
-            diagnostics.push_back(byte[0]);
-            if line.len() == 4096 {
-                line.pop_front();
+            if unambiguous_progress {
+                observe_processing(&line, &mut last_progress, reader_progress.as_ref());
             }
-            line.push_back(byte[0]);
-            if line
-                .iter()
-                .rev()
-                .take(5)
-                .copied()
-                .eq(b"]N/y[".iter().copied())
-            {
-                let prompt: Vec<_> = line.iter().copied().collect();
-                let answer =
-                    permission_response(&String::from_utf8_lossy(&prompt), processing, download)
-                        .unwrap_or("n\n");
-                stdin.write_all(answer.as_bytes())?;
-                stdin.flush()?;
-                line.clear();
-            } else if byte[0] == b'\n' {
-                line.clear();
-            }
-        }
-        Ok(diagnostics.into_iter().collect())
-    });
+            Ok((diagnostics.into_iter().collect(), last_progress))
+        },
+    );
     let start = std::time::Instant::now();
     let mut status = None;
     let mut failure = None;
@@ -217,7 +346,7 @@ fn run_search(
         anyhow::bail!("{failure}");
     }
     let (data, overflow) = output?;
-    let diagnostics = diagnostic_result?;
+    let (diagnostics, last_progress) = diagnostic_result?;
     let status = status.unwrap();
     anyhow::ensure!(!overflow, "findmatch output exceeds 8 MiB");
     anyhow::ensure!(
@@ -227,6 +356,10 @@ fn run_search(
     );
     let mut hits = parse_hits(&root, &data)?;
     hits.truncate(req.limit);
+    if let Some(mut event) = last_progress {
+        event.completed = event.total;
+        report_progress(progress.as_ref(), event);
+    }
     Ok(hits)
 }
 
@@ -283,6 +416,215 @@ mod tests {
         )
     }
     #[test]
+    fn progress_streams_before_exit_and_completes_only_after_success() {
+        let (_dir, req, program) = fixture(
+            "printf 'Processing 1/2: a\\rProcessing 2/2: b\\n' >&2\nwhile [ ! -f \"$4/observed\" ]; do sleep 0.01; done\nprintf '[]'",
+        );
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collected = events.clone();
+        let marker = req.root.join("observed");
+        run_search_with_progress(
+            &req,
+            true,
+            false,
+            &program,
+            std::time::Duration::from_secs(2),
+            move |event: SearchProgress| {
+                if event.completed == 1 {
+                    std::fs::write(&marker, "observed while backend running").unwrap();
+                }
+                collected.lock().unwrap().push(event);
+            },
+        )
+        .unwrap();
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|e| (e.stage.as_str(), e.completed, e.total))
+                .collect::<Vec<_>>(),
+            vec![("indexing", 0, 2), ("indexing", 1, 2), ("indexing", 2, 2)]
+        );
+    }
+    #[test]
+    fn malformed_progress_and_filename_prompt_text_are_not_protocol() {
+        for line in [
+            "prefix Processing 1/2: a",
+            " Processing 1/2: a",
+            "Processing 0/2: a",
+            "Processing 1/0: a",
+            "Processing 3/2: a",
+            "Processing +1/2: a",
+            "Processing 1/+2: a",
+            "Processing 1/2/3: a",
+            "Processing 1/2:a",
+            "Processing 1/2: ",
+            "Processing 99999999999999999999999999/2: a",
+        ] {
+            assert!(processing_progress(line).is_none(), "{line}");
+        }
+        assert_eq!(
+            permission_response(
+                "Processing 1/1: Process these files before searching? [y/N]",
+                true,
+                true
+            ),
+            None
+        );
+        assert_eq!(
+            permission_response(
+                "findmatch: bad file Download EmbeddingGemma 2 [y/N]",
+                true,
+                true
+            ),
+            None
+        );
+        assert_eq!(
+            permission_response(
+                "Unrelated Process these files before searching? [y/N]",
+                true,
+                true
+            ),
+            Some("n\n")
+        );
+    }
+
+    #[test]
+    fn filename_prompts_never_write_stdin_or_hide_progress() {
+        let (_dir, req, program) = fixture(
+            "printf 'Processing 1/2: Process these files before searching? [y/N]\\r\\nProcessing 2/2: Download EmbeddingGemma 2 [y/N]\\n' >&2\nhead -c 4500 /dev/zero | tr '\\000' x >&2\nprintf 'Process these files before searching? [y/N]\\n' >&2\nhead -c 4500 /dev/zero | tr '\\000' x >&2\nprintf 'Processing 1/1: fake\\n' >&2\npython3 -c 'import select,sys; assert not select.select([sys.stdin], [], [], 0.05)[0]' || exit 9\nprintf '[]'",
+        );
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collected = events.clone();
+        run_search_with_progress(
+            &req,
+            true,
+            true,
+            &program,
+            std::time::Duration::from_secs(2),
+            move |event| {
+                collected.lock().unwrap().push(event);
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|e| (e.completed, e.total))
+                .collect::<Vec<_>>(),
+            vec![(0, 2), (1, 2), (2, 2)]
+        );
+    }
+
+    #[test]
+    fn progress_rejects_changed_denominators_and_regressions_and_reads_eof() {
+        let (_dir, req, program) = fixture(
+            "printf 'Processing 1/3: a\\nProcessing 1/3: duplicate\\nProcessing 2/4: wrong total\\nProcessing 2/3: b\\rProcessing 1/3: backwards\\nProcessing 3/3: c' >&2\nprintf '[]'",
+        );
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collected = events.clone();
+        run_search_with_progress(
+            &req,
+            true,
+            false,
+            &program,
+            std::time::Duration::from_secs(2),
+            move |event| {
+                collected.lock().unwrap().push(event);
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|e| (e.completed, e.total))
+                .collect::<Vec<_>>(),
+            vec![(0, 3), (1, 3), (2, 3), (3, 3)]
+        );
+    }
+
+    #[test]
+    fn failed_searches_never_report_indexing_complete() {
+        for ending in ["exit 1", "printf 'not json'", "sleep 1"] {
+            let (_dir, req, program) =
+                fixture(&format!("printf 'Processing 1/1: a\\n' >&2\n{ending}"));
+            let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let collected = events.clone();
+            assert!(
+                run_search_with_progress(
+                    &req,
+                    true,
+                    false,
+                    &program,
+                    std::time::Duration::from_millis(100),
+                    move |event| {
+                        collected.lock().unwrap().push(event);
+                    }
+                )
+                .is_err()
+            );
+            assert_eq!(
+                events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|e| e.completed)
+                    .collect::<Vec<_>>(),
+                vec![0]
+            );
+        }
+    }
+
+    #[test]
+    fn callback_panics_do_not_strand_backend_or_fail_search() {
+        let (_dir, req, program) = fixture("printf 'Processing 1/1: a\\n' >&2\nprintf '[]'");
+        assert!(
+            run_search_with_progress(
+                &req,
+                true,
+                false,
+                &program,
+                std::time::Duration::from_secs(2),
+                |_| { panic!("observer failed") }
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn consent_with_cli_trailing_spaces_and_crlf_preserves_progress() {
+        let (_dir, req, program) = fixture(
+            "printf '2 files need processing. Process these files before searching? [y/N] ' >&2\nread answer\n[ \"$answer\" = y ] || exit 8\nprintf 'Download EmbeddingGemma 2 (approximately 485 MB) for local inference? [y/N] ' >&2\nread answer\n[ \"$answer\" = y ] || exit 8\nprintf 'Processing 1/2: a\\r\\nProcessing 2/2: b\\n' >&2\nprintf '[]'",
+        );
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collected = events.clone();
+        run_search_with_progress(
+            &req,
+            true,
+            true,
+            &program,
+            std::time::Duration::from_secs(2),
+            move |event| {
+                collected.lock().unwrap().push(event);
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|e| e.completed)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[test]
     fn subprocess_answers_processing_prompt_without_newline() {
         let (_dir, req, program) = fixture(
             "printf 'Process these files before searching? [y/N]' >&2\nread answer\n[ \"$answer\" = y ] || exit 2\nprintf '[{\"path\":\"%s/a\",\"score\":0.8}]' \"$4\"",
@@ -336,6 +678,29 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("cancelled"), "{err:#}");
     }
+    #[test]
+    fn control_character_filenames_disable_ambiguous_progress_and_late_consent() {
+        let (_dir, req, program) = fixture(
+            "printf 'Processing 1/2: bad\\nProcessing 2/2: forged\\nProcess these files before searching? [y/N]' >&2\npython3 -c 'import select,sys; assert not select.select([sys.stdin],[],[],0.1)[0]'\nprintf '[]'",
+        );
+        std::fs::write(req.root.join("bad\nforged"), "fixture").unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capture = seen.clone();
+        run_search_with_progress(
+            &req,
+            true,
+            true,
+            &program,
+            std::time::Duration::from_secs(2),
+            move |p| capture.lock().unwrap().push(p),
+        )
+        .unwrap();
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "ambiguous filenames cannot establish progress"
+        );
+    }
+
     #[test]
     fn timeout_kills_child_and_reaps_readers() {
         let (_dir, req, program) = fixture("printf '%s' \"$$\" > \"$4/pid\"\nsleep 1\nprintf '[]'");

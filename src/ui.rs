@@ -7,6 +7,56 @@ const PANEL: u32 = 0x1b1e24;
 const ORANGE: u32 = 0xff9234;
 const MUTED: u32 = 0x9097a5;
 
+#[derive(Clone)]
+struct WorkProgress {
+    stage: String,
+    completed: usize,
+    total: usize,
+    bytes_read: u64,
+    cache_hits: usize,
+    started: std::time::Instant,
+}
+impl WorkProgress {
+    fn new(stage: &str) -> Self {
+        Self {
+            stage: stage.into(),
+            completed: 0,
+            total: 0,
+            bytes_read: 0,
+            cache_hits: 0,
+            started: std::time::Instant::now(),
+        }
+    }
+    fn fraction(&self) -> Option<f32> {
+        (self.total > 0).then(|| (self.completed as f32 / self.total as f32).min(1.0))
+    }
+    fn label(&self) -> String {
+        let count = if self.total > 0 {
+            format!(" · {} / {}", self.completed, self.total)
+        } else {
+            String::new()
+        };
+        let io = if self.bytes_read > 0 {
+            format!(" · {:.1} MiB read", self.bytes_read as f64 / 1048576.0)
+        } else {
+            String::new()
+        };
+        let cache = if self.cache_hits > 0 {
+            format!(" · {} cached", self.cache_hits)
+        } else {
+            String::new()
+        };
+        format!(
+            "{}{}{}{} · {}s elapsed",
+            self.stage,
+            count,
+            io,
+            cache,
+            self.started.elapsed().as_secs()
+        )
+    }
+}
+
 #[derive(Default)]
 struct ReviewSelection {
     master: Option<PathBuf>,
@@ -212,6 +262,8 @@ struct Organizer {
     reference: Option<PathBuf>,
     category: bool,
     busy: bool,
+    progress: Option<WorkProgress>,
+    progress_slot: Option<std::sync::Arc<std::sync::Mutex<Option<WorkProgress>>>>,
     status: String,
     dialog: Option<Dialog>,
     allow_processing: bool,
@@ -237,6 +289,8 @@ impl Organizer {
             reference: None,
             category: false,
             busy: false,
+            progress: None,
+            progress_slot: None,
             status: "Choose a directory to start. Your files stay local.".into(),
             dialog: None,
             allow_processing: false,
@@ -248,6 +302,71 @@ impl Organizer {
             s.load(root, cx);
         }
         s
+    }
+    fn begin_progress(
+        &mut self,
+        stage: &str,
+        cx: &mut Context<Self>,
+    ) -> std::sync::Arc<std::sync::Mutex<Option<WorkProgress>>> {
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        self.progress = Some(WorkProgress::new(stage));
+        self.progress_slot = Some(slot.clone());
+        let active = slot.clone();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(80))
+                    .await;
+                let keep = this
+                    .update(cx, |s, cx| {
+                        if !s
+                            .progress_slot
+                            .as_ref()
+                            .is_some_and(|slot| std::sync::Arc::ptr_eq(slot, &active))
+                        {
+                            return false;
+                        }
+                        if let Some(progress) =
+                            active.lock().unwrap_or_else(|e| e.into_inner()).take()
+                        {
+                            s.progress = Some(progress);
+                        }
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    break;
+                }
+            }
+        })
+        .detach();
+        slot
+    }
+    fn finish_progress(&mut self) {
+        self.progress_slot = None;
+        self.progress = None;
+    }
+    fn publish_inventory(
+        &mut self,
+        entries: Vec<core::FileEntry>,
+        rank: Option<&[PathBuf]>,
+        cx: &mut Context<Self>,
+    ) {
+        self.entries = entries;
+        self.visible = if let Some(rank) = rank {
+            rank_order(
+                &self
+                    .entries
+                    .iter()
+                    .map(|e| e.path.clone())
+                    .collect::<Vec<_>>(),
+                rank,
+            )
+        } else {
+            (0..self.entries.len()).collect()
+        };
+        cx.notify();
     }
     fn load(&mut self, root: PathBuf, cx: &mut Context<Self>) {
         self.load_preserving_category(root, None, cx);
@@ -281,30 +400,64 @@ impl Organizer {
         self.visible.clear();
         self.groups.clear();
         self.busy = true;
-        self.status = "Reading root-level files and checking duplicate groups…".into();
-        let task = cx.background_executor().spawn(async move {
-            let entries = core::scan(&root)?;
-            let groups = duplicates::groups(&entries)?;
-            anyhow::Ok((entries, groups))
-        });
+        self.status = "Reading root-level files…".into();
+        let slot = self.begin_progress("Reading inventory", cx);
+        let task = cx
+            .background_executor()
+            .spawn(async move { core::scan(&root) });
         cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let entries = match result {
+                Ok(entries) => entries,
+                Err(e) => {
+                    let _ = this.update(cx, |s, cx| {
+                        if s.generation != generation {
+                            return;
+                        }
+                        s.busy = false;
+                        s.finish_progress();
+                        s.status = format!("Could not open directory: {e:#}");
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+            let work = entries.clone();
+            let proceed = this
+                .update(cx, |s, cx| {
+                    if s.generation != generation {
+                        return false;
+                    }
+                    s.publish_inventory(entries, rank.as_deref(), cx);
+                    s.status = "Files ready · checking duplicate groups in background…".into();
+                    true
+                })
+                .unwrap_or(false);
+            if !proceed {
+                return;
+            }
+            let started = std::time::Instant::now();
+            let task = cx.background_executor().spawn(async move {
+                duplicates::groups_with_progress(&work, move |p| {
+                    *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(WorkProgress {
+                        stage: p.stage,
+                        completed: p.completed,
+                        total: p.total,
+                        bytes_read: p.bytes_read,
+                        cache_hits: p.cache_hits,
+                        started,
+                    });
+                })
+            });
             let result = task.await;
             let _ = this.update(cx, |s, cx| {
                 if s.generation != generation {
                     return;
                 }
                 s.busy = false;
+                s.finish_progress();
                 match result {
-                    Ok((entries, groups)) => {
-                        s.entries = entries;
-                        s.visible = if let Some(rank) = &rank {
-                            rank_order(
-                                &s.entries.iter().map(|e| e.path.clone()).collect::<Vec<_>>(),
-                                rank,
-                            )
-                        } else {
-                            (0..s.entries.len()).collect()
-                        };
+                    Ok(groups) => {
                         s.groups = groups;
                         s.status = format!(
                             "{} files · {} duplicate groups · root files only",
@@ -312,7 +465,7 @@ impl Organizer {
                             s.groups.len()
                         );
                     }
-                    Err(e) => s.status = format!("Could not open directory: {e:#}"),
+                    Err(e) => s.status = format!("Files loaded; duplicate scan failed: {e:#}"),
                 }
                 cx.notify();
             });
@@ -403,13 +556,25 @@ impl Organizer {
         let download = self.allow_download;
         self.busy = true;
         self.status = "Ranking files locally with findmatch…".into();
-        let task = cx
-            .background_executor()
-            .spawn(async move { search::search(&req, processing, download) });
+        let slot = self.begin_progress("Preparing semantic search", cx);
+        let started = std::time::Instant::now();
+        let task = cx.background_executor().spawn(async move {
+            search::search_with_progress(&req, processing, download, move |p| {
+                *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(WorkProgress {
+                    stage: p.stage,
+                    completed: p.completed,
+                    total: p.total,
+                    bytes_read: 0,
+                    cache_hits: 0,
+                    started,
+                });
+            })
+        });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |s, cx| {
                 s.busy = false;
+                s.finish_progress();
                 s.selection.clear();
                 match result {
                     Ok(hits) => {
@@ -440,12 +605,25 @@ impl Organizer {
         self.context = None;
         self.busy = true;
         self.status = "Comparing file hashes and photo similarity…".into();
+        let slot = self.begin_progress("Comparing duplicates", cx);
+        let started = std::time::Instant::now();
         let task = cx.background_executor().spawn(async move {
-            duplicates::find_duplicates(&reference, &entries).map(|d| (reference, d))
+            duplicates::find_duplicates_with_progress(&reference, &entries, move |p| {
+                *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(WorkProgress {
+                    stage: p.stage,
+                    completed: p.completed,
+                    total: p.total,
+                    bytes_read: p.bytes_read,
+                    cache_hits: p.cache_hits,
+                    started,
+                });
+            })
+            .map(|d| (reference, d))
         });
         cx.spawn(async move |this,cx| {
             let result=task.await;let _=this.update(cx,|s,cx| {
                 s.busy=false;
+                s.finish_progress();
                 match result {Ok((reference,dups))=>{
                     let mut paths=vec![reference.clone()];paths.extend(dups.iter().map(|d|d.path.clone()));
                     s.review_selection=ReviewSelection::default();s.review_selection.choose_master(reference);
@@ -558,6 +736,40 @@ impl Organizer {
             }
         }
         cx.notify();
+    }
+    fn progress_view(&self) -> AnyElement {
+        let Some(progress) = &self.progress else {
+            return div().into_any_element();
+        };
+        let fraction = progress.fraction();
+        let width = fraction.unwrap_or(0.25);
+        let mut fill = div()
+            .h_full()
+            .w(relative(width))
+            .rounded_md()
+            .bg(rgb(ORANGE));
+        if fraction.is_none() {
+            // Unknown-duration stages have a moving marker, not a fictional percentage.
+            let offset = (progress.started.elapsed().as_millis() % 1600) as f32 / 1600.0 * 0.75;
+            fill = fill.ml(relative(offset));
+        }
+        div()
+            .id("work-progress")
+            .flex()
+            .flex_col()
+            .gap_2()
+            .mb_2()
+            .child(progress.label())
+            .child(
+                div()
+                    .w_full()
+                    .h(px(6.))
+                    .rounded_md()
+                    .bg(rgb(0x343941))
+                    .overflow_hidden()
+                    .child(fill),
+            )
+            .into_any_element()
     }
     fn tile(&self, index: usize, position: usize, cx: &Context<Self>) -> AnyElement {
         let entry = &self.entries[index];
@@ -965,6 +1177,7 @@ impl Render for Organizer {
                     .border_color(rgb(0x303640))
                     .text_sm()
                     .text_color(rgb(if self.busy { ORANGE } else { MUTED }))
+                    .child(self.progress_view())
                     .child(self.status.clone()),
             );
         if let Some(index) = self.context {
@@ -1223,6 +1436,56 @@ mod tests {
             assert!(!view.read(cx).category);
             assert_eq!(view.read(cx).entries.len(), 1);
         });
+    }
+
+    #[test]
+    fn progress_fraction_is_bounded_and_unknown_total_is_indeterminate() {
+        let mut progress = super::WorkProgress::new("Scanning");
+        assert_eq!(progress.fraction(), None);
+        progress.completed = 3;
+        progress.total = 4;
+        assert_eq!(progress.fraction(), Some(0.75));
+        progress.completed = 9;
+        assert_eq!(progress.fraction(), Some(1.0));
+        assert!(progress.label().contains("9 / 4"));
+    }
+
+    #[gpui::test]
+    fn inventory_is_visible_while_duplicate_scan_is_still_busy(cx: &mut TestAppContext) {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::write(fixture.path().join("a.txt"), "fixture").unwrap();
+        let entries = file_organizer::core::scan(fixture.path()).unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| Organizer::new(None, cx));
+        cx.update(|_, cx| {
+            view.update(cx, |s, cx| {
+                s.busy = true;
+                s.publish_inventory(entries, None, cx);
+                assert!(s.busy);
+                assert_eq!(s.visible, vec![0]);
+                assert_eq!(s.entries.len(), 1);
+                assert!(s.groups.is_empty());
+            })
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn completed_operation_clears_progress_and_rejects_late_updates(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| Organizer::new(None, cx));
+        cx.update(|_, cx| {
+            view.update(cx, |s, cx| {
+                let slot = s.begin_progress("Indexing", cx);
+                let mut p = super::WorkProgress::new("Indexing");
+                p.completed = 2;
+                p.total = 3;
+                *slot.lock().unwrap() = Some(p);
+                s.finish_progress();
+                assert!(s.progress.is_none());
+                assert!(s.progress_slot.is_none());
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| assert!(view.read(cx).progress.is_none()));
     }
 
     #[test]

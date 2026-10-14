@@ -1,5 +1,5 @@
 { lib, stdenv, rustPlatform, pkg-config, clang, cmake, makeWrapper, makeDesktopItem,
-  copyDesktopItems, libclang, findmatch, runtimeLibraries }:
+  copyDesktopItems, libclang, python3, findmatch, runtimeLibraries }:
 
 rustPlatform.buildRustPackage {
   pname = "file-organizer";
@@ -7,6 +7,7 @@ rustPlatform.buildRustPackage {
   src = lib.cleanSource ../.;
   cargoHash = "sha256-Zd4n4s0iB/9x0DwVaGLDJeWQagJI9lEB7MODCEhf2Oc=";
   nativeBuildInputs = [ pkg-config clang cmake makeWrapper copyDesktopItems ];
+  nativeCheckInputs = [ python3 ];
   buildInputs = runtimeLibraries;
   LIBCLANG_PATH = "${libclang.lib}/lib";
   FILE_ORGANIZER_FINDMATCH = "${findmatch}/bin/findmatch";

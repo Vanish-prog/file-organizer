@@ -38,6 +38,14 @@ Folder inclusion and flattening do not overwrite name collisions. These moves cu
 
 Categorization uses the folder name plus the chosen reference file as a findmatch query. Semantic cosine scores are not duplicate confidence or probabilities. New/changed files require explicit processing permission; an initial model download requires separate permission. Unknown formats may be ranked by metadata only, per findmatch's format support.
 
+## Large libraries and progress
+
+The file grid appears as soon as inventory is ready; duplicate detection continues in the background. Organization/search actions remain disabled during the scan to avoid mutating files underneath it. Duplicate detection and semantic indexing have stage-aware progress bars, file counts, and elapsed time. Duplicate scans also report bytes read and cache hits. Model initialization and other stages without a known denominator use an animated indicator rather than a made-up percentage.
+
+Duplicate detection filters exact-match candidates by size and sampled contents before full hashing, uses bounded worker concurrency, and indexes visual fingerprints before applying conservative pairwise checks. Sampling alone never establishes a duplicate. Cached hashes/fingerprints are stored outside the library under the user's cache directory and reused for unchanged files, including files moved by flattening. The first scan still needs to decode uncached images; large collections of very similar photos can still require many comparisons. Suggestions always require explicit human review and Trash confirmation.
+
+Semantic indexing remains consent-gated and does not start when flattening. Progress is forwarded from findmatch's processing output; a file is counted complete only after the next file starts or the backend confirms completion. A progress bar counts files, not equal-cost work: one video may take much longer than one photo. For filenames containing CR/newline characters, the legacy backend's text output is ambiguous, so the organizer safely uses an indeterminate indicator instead of parsing file counts. Consent is never accepted from processing output.
+
 ## Provenance and dependencies
 
 Application code, tests, documentation and packaging are completely AI-authored with Hermes Agent. No application license has been selected yet. Third-party code retains its own licenses; GPUI is Apache-2.0 and findmatch is MIT. Model licensing is separate.
